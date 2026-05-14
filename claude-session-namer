@@ -1,0 +1,509 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""
+claude-session-namer - Automatic session naming for Claude Code.
+
+Runs as a SessionEnd hook. When a session ends, checks if it has substantive
+content and no custom title yet, then spawns a background worker that calls
+`claude -p` to generate a descriptive kebab-case title.
+
+Usage:
+  ./claude-session-namer install    Register the SessionEnd hook in ~/.claude/settings.json
+  ./claude-session-namer uninstall  Remove the hook
+  ./claude-session-namer status     Show installation status
+  ./claude-session-namer backfill [--all] [--dry-run] [--model MODEL]
+                                    Name untitled sessions in the current project (--all for every project)
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+
+SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
+DEFAULT_MODEL = os.environ.get("CLAUDE_SESSION_NAMER_MODEL", "haiku")
+SCRIPT_PATH = Path(__file__).resolve()
+
+TITLE_PROMPT = """\
+Generate a short title for the conversation below.
+
+Format: lowercase words joined by hyphens (e.g. fix-stripe-webhook-retry)
+Length: 4-8 words, 10-60 characters
+
+Rules:
+- Specific: name the actual technology, feature, file, or bug — not the category
+- Base the title on the PRIMARY topic from Turns 1-3; later turns are context only
+- Avoid vague words: help, work, session, chat, question, task, code, issue, debug, fix, add, update
+- No URLs, file paths, or version numbers
+
+Bad (too generic): fix-auth-bug, add-feature, debug-code, update-config
+Good (specific): stripe-webhook-retry-exponential-backoff, postgres-migration-add-user-roles, react-modal-close-on-escape
+{avoid}
+Output ONLY the title, nothing else.
+
+<conversation>
+{conversation}
+</conversation>"""
+
+
+# ---------------------------------------------------------------------------
+# Transcript parsing
+# ---------------------------------------------------------------------------
+
+def _text_from_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block.get("text", "")
+    return ""
+
+
+def _is_system_text(text: str) -> bool:
+    s = text.strip()
+    return not s or s.startswith("<") or (s.startswith("/") and "\n" not in s)
+
+
+def parse_transcript(path: str) -> tuple[list[str], list[str], bool]:
+    """
+    Returns (user_messages, assistant_messages, has_custom_title).
+    Filters out system/command messages.
+    """
+    user_msgs: list[str] = []
+    assistant_msgs: list[str] = []
+    has_custom_title = False
+
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if entry.get("type") == "custom-title":
+                    has_custom_title = True
+                    continue
+
+                entry_type = entry.get("type")
+                if entry_type not in ("user", "assistant"):
+                    continue
+
+                msg = entry.get("message", {})
+                role = msg.get("role", "")
+                text = _text_from_content(msg.get("content", ""))
+
+                if role == "user" and not _is_system_text(text):
+                    user_msgs.append(text)
+                elif role == "assistant" and text.strip():
+                    assistant_msgs.append(text)
+    except OSError:
+        pass
+
+    return user_msgs, assistant_msgs, has_custom_title
+
+
+# ---------------------------------------------------------------------------
+# Title generation
+# ---------------------------------------------------------------------------
+
+def _normalize_title(raw: str) -> str | None:
+    t = raw.strip()
+    t = re.sub(r'["\'\*`]', "", t)
+    t = re.sub(r"[\s_]+", "-", t)
+    t = t.lower()
+    t = re.sub(r"[^a-z0-9-]", "", t)
+    t = re.sub(r"-+", "-", t)
+    t = t.strip("-")
+    if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", t):
+        return None
+    if not (10 <= len(t) <= 60):
+        return None
+    return t
+
+
+def generate_title(conversation: str, model: str = DEFAULT_MODEL, avoid: set[str] | None = None) -> str | None:
+    avoid_line = f"- These titles are already taken, generate something distinct: {', '.join(sorted(avoid))}\n" if avoid else ""
+    prompt = TITLE_PROMPT.format(conversation=conversation, avoid=avoid_line)
+    worker_dir = Path(tempfile.mkdtemp(prefix="claude-session-namer-"))
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", model, prompt],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(worker_dir),
+        )
+        if result.returncode != 0:
+            return None
+        return _normalize_title(result.stdout)
+    except Exception:
+        return None
+    finally:
+        # Remove the worker session directory so it doesn't appear in --resume.
+        # Use the resolved path so the key matches how Claude Code stores it on macOS
+        # (where /tmp -> /private/tmp and the project key includes the leading slash as a dash).
+        project_key = str(Path(worker_dir).resolve()).replace("/", "-")
+        session_dir = Path.home() / ".claude" / "projects" / project_key
+        shutil.rmtree(session_dir, ignore_errors=True)
+        shutil.rmtree(worker_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Background worker
+# ---------------------------------------------------------------------------
+
+def name_session(session_id: str, transcript_path: str, model: str = DEFAULT_MODEL) -> None:
+    """Generate and write a title for a session. Called in a background process."""
+    try:
+        user_msgs, assistant_msgs, has_custom_title = parse_transcript(transcript_path)
+        if has_custom_title or not user_msgs or not assistant_msgs:
+            return
+
+        title = generate_title(_build_conversation(user_msgs, assistant_msgs), model)
+        if not title:
+            return
+
+        with open(transcript_path, "a") as f:
+            f.write(json.dumps({
+                "type": "custom-title",
+                "customTitle": title,
+                "sessionId": session_id,
+            }) + "\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# SessionEnd hook
+# ---------------------------------------------------------------------------
+
+def run_hook(data: dict) -> None:
+    session_id = data.get("session_id", "")
+    transcript_path = data.get("transcript_path", "")
+
+    if not session_id or not transcript_path or not os.path.exists(transcript_path):
+        return
+
+    user_msgs, assistant_msgs, has_custom_title = parse_transcript(transcript_path)
+
+    if has_custom_title or not user_msgs or not assistant_msgs:
+        return
+
+    subprocess.Popen(
+        [sys.executable, str(SCRIPT_PATH), "--name", session_id, transcript_path],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Install / uninstall / status
+# ---------------------------------------------------------------------------
+
+def _load_settings() -> dict:
+    if SETTINGS_FILE.exists():
+        try:
+            return json.loads(SETTINGS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_settings(settings: dict) -> None:
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2) + "\n")
+
+
+def install() -> None:
+    settings = _load_settings()
+    hook_command = str(SCRIPT_PATH)
+    stop_hooks = settings.setdefault("hooks", {}).setdefault("SessionEnd", [])
+
+    # Remove stale entries from this script
+    stop_hooks[:] = [
+        h for h in stop_hooks
+        if not any("claude-session-namer" in hh.get("command", "") for hh in h.get("hooks", []))
+    ]
+    stop_hooks.append({"hooks": [{"type": "command", "command": hook_command}]})
+
+    _save_settings(settings)
+    print(f"Installed: {hook_command}")
+
+
+def uninstall() -> None:
+    settings = _load_settings()
+    stop_hooks = settings.get("hooks", {}).get("SessionEnd", [])
+    stop_hooks[:] = [
+        h for h in stop_hooks
+        if not any("claude-session-namer" in hh.get("command", "") for hh in h.get("hooks", []))
+    ]
+    if not stop_hooks:
+        settings.get("hooks", {}).pop("SessionEnd", None)
+    if not settings.get("hooks"):
+        settings.pop("hooks", None)
+    _save_settings(settings)
+    print("Uninstalled.")
+
+
+def status() -> None:
+    settings = _load_settings()
+    for entry in settings.get("hooks", {}).get("SessionEnd", []):
+        for hook in entry.get("hooks", []):
+            if "claude-session-namer" in hook.get("command", ""):
+                print(f"Installed — SessionEnd hook registered in {SETTINGS_FILE}")
+                print(f"Command: {hook['command']}")
+                return
+    print(f"Not installed — no SessionEnd hook found in {SETTINGS_FILE}")
+
+
+# ---------------------------------------------------------------------------
+# Backfill
+# ---------------------------------------------------------------------------
+
+def _cwd_project_dir() -> Path:
+    """Map the current working directory to its Claude project directory."""
+    key = str(Path.cwd()).lstrip("/").replace("/", "-")
+    return Path.home() / ".claude" / "projects" / key
+
+
+def _read_custom_title(path: str) -> str | None:
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                    if entry.get("type") == "custom-title":
+                        return entry.get("customTitle")
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def _build_conversation(user_msgs: list[str], assistant_msgs: list[str]) -> str:
+    parts = []
+    for i, (u, a) in enumerate(zip(user_msgs[:4], assistant_msgs[:4]), start=1):
+        parts.append(f"Turn {i} User: {u[:400]}")
+        parts.append(f"Turn {i} Assistant: {a[:200]}")
+    return "\n\n".join(parts)
+
+
+DEFAULT_CONCURRENCY = 5
+
+
+def _generate_for_session(
+    session_id: str,
+    path: str,
+    user_msgs: list[str],
+    assistant_msgs: list[str],
+    model: str,
+    avoid: set[str],
+) -> tuple[str, str, str | None]:
+    title = generate_title(_build_conversation(user_msgs, assistant_msgs), model, avoid=avoid or None)
+    return session_id, path, title
+
+
+def _deduplicate_with_regen(
+    proposed: list[tuple[str, str, str]],
+    candidates_map: dict[str, tuple[list[str], list[str]]],
+    model: str,
+    pre_existing: set[str],
+) -> list[tuple[str, str, str]]:
+    seen: set[str] = set()
+    result = []
+    for session_id, path, title in proposed:
+        if title not in seen:
+            seen.add(title)
+            result.append((session_id, path, title))
+            continue
+        # Duplicate — try to regenerate with the collision set as avoid
+        u_msgs, a_msgs = candidates_map.get(session_id, ([], []))
+        avoid = pre_existing | seen
+        new_title = generate_title(_build_conversation(u_msgs, a_msgs), model, avoid=avoid)
+        if new_title and new_title not in seen:
+            seen.add(new_title)
+            result.append((session_id, path, new_title))
+            print(f"  {session_id[:8]}... renamed duplicate '{title}' → '{new_title}'")
+        else:
+            # Last resort: append counter suffix
+            unique = title
+            counter = 2
+            while unique in seen:
+                unique = f"{title}-{counter}"
+                counter += 1
+            seen.add(unique)
+            result.append((session_id, path, unique))
+    return result
+
+
+def backfill(all_projects: bool = False, dry_run: bool = False, model: str = DEFAULT_MODEL, concurrency: int = DEFAULT_CONCURRENCY) -> None:
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        print("No projects directory found.")
+        return
+
+    if all_projects:
+        search_root = projects_dir
+        scope = "all projects"
+    else:
+        search_root = _cwd_project_dir()
+        scope = str(Path.cwd())
+        if not search_root.exists():
+            print(f"No session directory found for {scope}")
+            return
+
+    candidates = []
+    # Only scan project_dir/*.jsonl — skip subagent files nested deeper (e.g. session/subagents/*.jsonl)
+    for project_dir in (search_root.iterdir() if all_projects else [search_root]):
+        if not project_dir.is_dir():
+            continue
+        for jsonl in project_dir.glob("*.jsonl"):
+            session_id = jsonl.stem
+            user_msgs, assistant_msgs, has_custom_title = parse_transcript(str(jsonl))
+            if has_custom_title or not user_msgs or not assistant_msgs:
+                continue
+            candidates.append((session_id, str(jsonl), user_msgs, assistant_msgs))
+
+    if not candidates:
+        print(f"No untitled sessions found in {scope}.")
+        return
+
+    pre_existing: set[str] = {
+        t
+        for project_dir in (search_root.iterdir() if all_projects else [search_root])
+        if project_dir.is_dir()
+        for jsonl in project_dir.glob("*.jsonl")
+        if (t := _read_custom_title(str(jsonl)))
+    }
+
+    print(f"Found {len(candidates)} untitled session(s) in {scope}. Generating titles with {concurrency} workers...")
+
+    results: dict[str, tuple[str, str | None]] = {}  # session_id -> (path, title)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {
+            pool.submit(_generate_for_session, sid, path, u, a, model, pre_existing): sid
+            for sid, path, u, a in candidates
+        }
+        try:
+            for future in as_completed(futures):
+                session_id, path, title = future.result()
+                results[session_id] = (path, title)
+                print(f"  {session_id[:8]}... {title or 'failed'}")
+        except KeyboardInterrupt:
+            for f in futures:
+                f.cancel()
+            print("\nCancelled.")
+            return
+
+    candidates_map = {sid: (u, a) for sid, _, u, a in candidates}
+    proposed: list[tuple[str, str, str]] = []
+    for sid, *_ in candidates:
+        path, title = results.get(sid, (None, None))
+        if path and title:
+            proposed.append((sid, path, title))
+    proposed = _deduplicate_with_regen(proposed, candidates_map, model, pre_existing)
+
+    if not proposed:
+        print("No titles could be generated.")
+        return
+
+    if dry_run:
+        try:
+            response = input(f"\nApply {len(proposed)} title(s)? (y/N) ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return
+        if response != "y":
+            print("Cancelled — no changes made.")
+            return
+
+    for session_id, path, title in proposed:
+        with open(path, "a") as f:
+            f.write(json.dumps({
+                "type": "custom-title",
+                "customTitle": title,
+                "sessionId": session_id,
+            }) + "\n")
+
+    if dry_run:
+        print(f"Applied {len(proposed)} title(s).")
+    else:
+        print(f"Named {len(proposed)} session(s).")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+USAGE = """\
+Usage: claude-session-namer <command> [options]
+
+Commands:
+  install                  Register the SessionEnd hook in ~/.claude/settings.json
+  uninstall                Remove the hook
+  status                   Show installation status
+  backfill                 Name untitled sessions in the current project
+    --all                  Run across all projects instead
+    --concurrency <n>      Parallel workers when using --all (default: 5)
+    --dry-run              Preview without making changes
+    --model <model>        Model to use for title generation (default: haiku)
+  --help, -h               Show this help message
+
+Environment:
+  CLAUDE_SESSION_NAMER_MODEL  Default model (overrides haiku default)
+"""
+
+if __name__ == "__main__":
+    try:
+        args = sys.argv[1:]
+
+        if not args or "--help" in args or "-h" in args:
+            print(USAGE, end="")
+        elif args[0] == "install":
+            install()
+        elif args[0] == "uninstall":
+            uninstall()
+        elif args[0] == "status":
+            status()
+        elif args[0] == "backfill":
+            all_projects = "--all" in args
+            dry_run = "--dry-run" in args
+            model = DEFAULT_MODEL
+            concurrency = DEFAULT_CONCURRENCY
+            for i, a in enumerate(args):
+                if a == "--model" and i + 1 < len(args):
+                    model = args[i + 1]
+                elif a == "--concurrency" and i + 1 < len(args):
+                    try:
+                        concurrency = int(args[i + 1])
+                    except ValueError:
+                        print(f"Invalid --concurrency value: {args[i + 1]}")
+                        sys.exit(1)
+            backfill(all_projects=all_projects, dry_run=dry_run, model=model, concurrency=concurrency)
+        elif args[0] == "--name" and len(args) == 3:
+            name_session(args[1], args[2])
+        else:
+            try:
+                data = json.load(sys.stdin)
+            except Exception:
+                data = {}
+            run_hook(data)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)
