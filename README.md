@@ -15,7 +15,7 @@ Inspired by [claude-rename](https://github.com/sathwick-p/claude-rename). Python
 ## Commands
 
 | Command | Description |
-|---------|-------------|
+| --------- | ------------- |
 | `claude-session-namer install` | Install the Stop hook |
 | `claude-session-namer uninstall` | Remove the Stop hook |
 | `claude-session-namer status` | Show installation status |
