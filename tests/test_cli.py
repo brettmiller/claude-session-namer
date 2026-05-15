@@ -57,7 +57,7 @@ class TestUnknownCommand:
             capture_output=True, text=True, timeout=10,
         )
         assert result.returncode == 1
-        assert "Unknown command" in result.stderr
+        assert "Error: unknown command" in result.stderr
         assert "Usage:" in result.stderr
 
 
