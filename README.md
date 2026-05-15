@@ -16,12 +16,12 @@ Inspired by [claude-rename](https://github.com/sathwick-p/claude-rename). Python
 
 | Command | Description |
 | --------- | ------------- |
-| `claude-session-namer install` | Install the Stop hook |
-| `claude-session-namer uninstall` | Remove the Stop hook |
+| `claude-session-namer install` | Install the SessionEnd hook |
+| `claude-session-namer uninstall` | Remove the SessionEnd hook |
 | `claude-session-namer status` | Show installation status |
 | `claude-session-namer backfill [--all] [--dry-run] [--model <model>] [--concurrency <n>]` | Name untitled sessions in the current project (`--all` for every project, `--dry-run` to preview and confirm, `--concurrency` to set parallel workers for large backlogs (default: 5), `--model` to override the default haiku) |
 
-After installing, open `/hooks` in Claude Code (or restart) to pick up the new hook.
+After installing, run `/hooks` in Claude Code or restart to pick up the new hook.
 
 ## Examples
 
@@ -40,6 +40,7 @@ Override the default model globally with the `CLAUDE_SESSION_NAMER_MODEL` enviro
 2. Skips if the session already has a custom title or lacks substantive content
    (at least one real user message + one assistant reply)
 3. Spawns a detached background process that calls `claude -p --model haiku` with the
-   first few turns of the conversation
+   first few turns of the conversation as context — naming runs async and typically
+   completes 10–20 seconds after the session ends
 4. Appends `{"type": "custom-title", "customTitle": "fix-stripe-webhook-retry", ...}`
    to the session JSONL

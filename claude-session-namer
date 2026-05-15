@@ -141,7 +141,7 @@ def generate_title(conversation: str, model: str = DEFAULT_MODEL, avoid: set[str
     worker_dir = Path(tempfile.mkdtemp(prefix="claude-session-namer-"))
     try:
         result = subprocess.run(
-            ["claude", "-p", "--model", model, prompt],
+            ["claude", "-p", "--model", model, "--no-session-persistence", prompt],
             capture_output=True,
             text=True,
             timeout=60,
