@@ -1,8 +1,9 @@
 # claude-session-naming
 
-Automatic session naming for Claude Code. Runs as a `SessionEnd` hook — when a session
-ends it checks whether it has real content and no title yet, then spawns a background
-worker that calls `claude -p` to generate a descriptive kebab-case title.
+Automatic session naming for Claude Code. Install it as a `SessionEnd` hook and sessions
+are named automatically when they end. Run with `backfill` to name existing untitled
+sessions. Titles are short kebab-case slugs (e.g. `fix-webhook-retry-fail`) generated
+by `claude -p`.
 
 Inspired by [claude-rename](https://github.com/sathwick-p/claude-rename). Python port with no external dependencies. Unlike claude-rename, this runs once at session exit rather than in the background after each exchange.
 
