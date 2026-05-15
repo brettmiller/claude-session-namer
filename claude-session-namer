@@ -551,11 +551,9 @@ if __name__ == "__main__":
         elif args[0] == "--name" and len(args) == 3:
             name_session(args[1], args[2])
         else:
-            try:
-                data = json.load(sys.stdin)
-            except Exception:
-                data = {}
-            run_hook(data)
+            print(f"Unknown command: {args[0]}", file=sys.stderr)
+            print(USAGE, end="", file=sys.stderr)
+            sys.exit(1)
     except KeyboardInterrupt:
         print("\nCancelled.")
         sys.exit(130)

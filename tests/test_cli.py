@@ -50,6 +50,17 @@ class TestStatus:
         assert "Not installed" in capsys.readouterr().out
 
 
+class TestUnknownCommand:
+    def test_unknown_command_exits_nonzero_with_error(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--backfill"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 1
+        assert "Unknown command" in result.stderr
+        assert "Usage:" in result.stderr
+
+
 class TestHelpFlag:
     def test_help_detected_in_any_position(self):
         # Regression: old code only checked args[0], so "backfill --help" didn't show usage.
