@@ -100,6 +100,17 @@ class TestRunHook:
             sn.run_hook({"session_id": "abc123", "transcript_path": str(f)})
         mock_popen.assert_called_once()
 
+    def test_skips_when_skip_env_var_set(self, tmp_path):
+        # Primary recursion guard: generate_title passes CLAUDE_SESSION_NAMER_SKIP=1 to
+        # its claude -p subprocess. When that sub-session fires the hook, run_hook must
+        # exit immediately before spawning another background process.
+        f = tmp_path / "s.jsonl"
+        make_session(f)
+        with patch("subprocess.Popen") as mock_popen:
+            with patch.dict(os.environ, {"CLAUDE_SESSION_NAMER_SKIP": "1"}):
+                sn.run_hook({"session_id": "abc123", "transcript_path": str(f)})
+        mock_popen.assert_not_called()
+
     def test_skips_worker_session_path(self, tmp_path):
         # Regression: generate_title's claude -p creates a temp session whose project
         # key contains "claude-session-namer-" (temp prefix with trailing dash). When
@@ -140,6 +151,17 @@ class TestGenerateTitle:
         call_kwargs = mock_run.call_args.kwargs
         env = call_kwargs.get("env", {})
         assert env.get("CLAUDE_SESSION_NAMER_SKIP") == "1"
+
+    def test_passes_no_session_persistence_flag(self):
+        # Regression: without this flag claude -p persists its own session, polluting
+        # the session list with naming worker sessions.
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "fix-stripe-webhook-retry"
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            sn.generate_title("some conversation")
+        cmd = mock_run.call_args.args[0]
+        assert "--no-session-persistence" in cmd
 
     def test_logs_stderr_on_nonzero_exit(self, capsys):
         mock_result = MagicMock()
