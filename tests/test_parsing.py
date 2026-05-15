@@ -35,17 +35,19 @@ class TestParseTranscript:
         _, _, has_title = sn.parse_transcript(str(f))
         assert has_title
 
-    def test_detects_ai_title(self, tmp_path):
-        # Regression: ai-title was previously ignored
+    def test_does_not_detect_ai_title_as_named(self, tmp_path):
+        # ai-title is NOT "has_title" — Claude Code writes ai-title before the hook fires,
+        # so treating it as "already named" would prevent our hook from ever running.
+        # ai-title IS used by _read_session_title to build the avoid set, not to skip.
         f = tmp_path / "s.jsonl"
         write_jsonl(f, [
             user_entry("Hello"), asst_entry("World"),
             {"type": "ai-title", "aiTitle": "Analyze something", "sessionId": "abc"},
         ])
         _, _, has_title = sn.parse_transcript(str(f))
-        assert has_title
+        assert not has_title
 
-    def test_detects_either_title_type(self, tmp_path):
+    def test_detects_custom_title_even_when_ai_title_present(self, tmp_path):
         f = tmp_path / "s.jsonl"
         write_jsonl(f, [
             user_entry("Hello"), asst_entry("World"),

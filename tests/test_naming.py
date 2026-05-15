@@ -30,28 +30,33 @@ class TestNameSession:
         assert result is None
         mock_gen.assert_not_called()
 
-    def test_skips_session_with_ai_title(self, tmp_path):
-        # Regression: sessions with ai-title were previously processed as untitled
+    def test_names_session_with_only_ai_title(self, tmp_path):
+        # Claude Code writes ai-title BEFORE firing the SessionEnd hook, so a session with
+        # only ai-title is still "untitled" from our tool's perspective. We must name it.
         f = tmp_path / "s.jsonl"
         write_jsonl(f, [
             {"type": "user", "message": {"role": "user", "content": "Hello"}},
             {"type": "assistant", "message": {"role": "assistant", "content": "World"}},
             {"type": "ai-title", "aiTitle": "Analyze programming languages"},
         ])
-        with patch.object(sn, "generate_title") as mock_gen:
+        with patch.object(sn, "generate_title", return_value="analyze-programming-here"):
             result = sn.name_session("abc", str(f))
-        assert result is None
-        mock_gen.assert_not_called()
+        assert result == "analyze-programming-here"
+        assert '"custom-title"' in f.read_text()
 
     def test_names_untitled_session(self, tmp_path):
         f = tmp_path / "s.jsonl"
         make_session(f)
-        with patch.object(sn, "generate_title", return_value="python-language-overview"):
+        with patch.object(sn, "generate_title", return_value="python-language-overview") as mock_gen:
             result = sn.name_session("abc123", str(f))
         assert result == "python-language-overview"
         content = f.read_text()
         assert '"custom-title"' in content
         assert "python-language-overview" in content
+        # Verify _build_conversation output reaches generate_title
+        conversation_arg = mock_gen.call_args.args[0]
+        assert "Turn 1 User:" in conversation_arg
+        assert "What is Python" in conversation_arg
 
     def test_returns_none_when_generate_fails(self, tmp_path):
         f = tmp_path / "s.jsonl"
@@ -157,19 +162,22 @@ class TestBackfillCandidates:
             sn.backfill(all_projects=False)
         assert "No untitled sessions" in capsys.readouterr().out
 
-    def test_excludes_ai_titled_sessions(self, tmp_path, capsys):
-        # Regression: ai-titled sessions were treated as untitled candidates
+    def test_includes_ai_titled_sessions(self, tmp_path, capsys):
+        # Sessions with only ai-title (no custom-title) are untitled from our perspective.
+        # backfill must name them so they get a unique custom-title.
         proj = tmp_path / "proj"
         proj.mkdir()
-        write_jsonl(proj / "s.jsonl", [
+        f = proj / "s.jsonl"
+        write_jsonl(f, [
             {"type": "user", "message": {"role": "user", "content": "Hello"}},
             {"type": "assistant", "message": {"role": "assistant", "content": "World"}},
             {"type": "ai-title", "aiTitle": "Analyze programming languages in subdirectories"},
         ])
         with patch.object(sn, "_cwd_project_dir", return_value=proj):
-            with patch.object(sn, "generate_title") as mock_gen:
-                sn.backfill(all_projects=False)
-        mock_gen.assert_not_called()
+            with patch.object(sn, "generate_title", return_value="analyze-programming-subdirectories"):
+                with patch("builtins.print"):
+                    sn.backfill(all_projects=False)
+        assert '"custom-title"' in f.read_text()
 
     def test_excludes_subagent_files(self, tmp_path):
         # Regression: rglob("*.jsonl") was picking up session/subagents/*.jsonl
@@ -191,6 +199,37 @@ class TestBackfillCandidates:
         assert subagent_file.read_text() == before
         # Main session must have been named
         assert "main-session-title" in (proj / "main.jsonl").read_text()
+
+    def test_deduplicates_titles_across_sessions(self, tmp_path):
+        # Verifies _deduplicate_with_regen is actually called from backfill:
+        # when two sessions would get the same title, they must end up with distinct ones.
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        make_session(proj / "a.jsonl")
+        make_session(proj / "b.jsonl")
+        with patch.object(sn, "_cwd_project_dir", return_value=proj):
+            with patch.object(sn, "generate_title", side_effect=[
+                "same-python-title-here",  # session a initial
+                "same-python-title-here",  # session b initial (duplicate)
+                "python-distinct-variant",  # retry for the duplicate
+            ]):
+                with patch("builtins.print"):
+                    sn.backfill(all_projects=False)
+
+        def extract_custom_title(path):
+            for line in path.read_text().splitlines():
+                try:
+                    e = json.loads(line)
+                    if e.get("type") == "custom-title":
+                        return e["customTitle"]
+                except Exception:
+                    pass
+            return None
+
+        a_title = extract_custom_title(proj / "a.jsonl")
+        b_title = extract_custom_title(proj / "b.jsonl")
+        assert a_title is not None and b_title is not None
+        assert a_title != b_title
 
     def test_includes_untitled_sessions(self, tmp_path, capsys):
         proj = tmp_path / "proj"

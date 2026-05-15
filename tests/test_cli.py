@@ -1,7 +1,12 @@
 import json
+import subprocess
+import sys
 import pytest
+from pathlib import Path
 from unittest.mock import patch
 import session_namer as sn
+
+SCRIPT = Path(__file__).parent.parent / "claude-session-namer"
 
 
 class TestStatus:
@@ -47,16 +52,13 @@ class TestStatus:
 
 class TestHelpFlag:
     def test_help_detected_in_any_position(self):
-        # Regression: old code only checked args[0]
-        cases = [
-            ["--help"],
-            ["-h"],
-            ["backfill", "--help"],
-            ["--help", "backfill"],
-            ["install", "-h"],
-        ]
-        for args in cases:
-            assert "--help" in args or "-h" in args
+        # Regression: old code only checked args[0], so "backfill --help" didn't show usage.
+        for args in [["--help"], ["-h"], ["backfill", "--help"], ["install", "-h"]]:
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT)] + args,
+                capture_output=True, text=True, timeout=10,
+            )
+            assert "Usage:" in result.stdout, f"Expected 'Usage:' for args {args}"
 
 
 class TestCwdProjectDir:
@@ -66,3 +68,13 @@ class TestCwdProjectDir:
         assert result.name.startswith("-"), (
             f"Project dir key should start with '-' (from leading '/'), got: {result.name}"
         )
+
+    def test_key_replaces_dots_with_dashes(self):
+        # Regression: only '/' was replaced; dots in path components (Brett.Miller, github.com)
+        # were preserved, producing a key that never matches the real Claude project directory.
+        from pathlib import Path
+        from unittest.mock import patch
+        fake_cwd = Path("/Users/Brett.Miller/code/github.com/myproject")
+        with patch.object(Path, "cwd", return_value=fake_cwd):
+            result = sn._cwd_project_dir()
+        assert result.name == "-Users-Brett-Miller-code-github-com-myproject", result.name
