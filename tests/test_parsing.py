@@ -91,6 +91,31 @@ class TestParseTranscript:
         assert asst_msgs == []
         assert not has_title
 
+    def test_list_content_format(self, tmp_path):
+        # Real Claude Code messages use list content: [{"type": "text", "text": "..."}]
+        f = tmp_path / "s.jsonl"
+        write_jsonl(f, [
+            {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Hello from list"}]}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "World from list"}]}},
+        ])
+        user_msgs, asst_msgs, _ = sn.parse_transcript(str(f))
+        assert user_msgs == ["Hello from list"]
+        assert asst_msgs == ["World from list"]
+
+    def test_skips_blank_lines(self, tmp_path):
+        f = tmp_path / "s.jsonl"
+        f.write_text("\n" + json.dumps(user_entry("Hello")) + "\n\n" + json.dumps(asst_entry("World")) + "\n")
+        user_msgs, asst_msgs, _ = sn.parse_transcript(str(f))
+        assert user_msgs == ["Hello"]
+        assert asst_msgs == ["World"]
+
+    def test_skips_invalid_json_lines(self, tmp_path):
+        f = tmp_path / "s.jsonl"
+        f.write_text("not json\n" + json.dumps(user_entry("Hello")) + "\n" + json.dumps(asst_entry("World")) + "\n")
+        user_msgs, asst_msgs, _ = sn.parse_transcript(str(f))
+        assert user_msgs == ["Hello"]
+        assert asst_msgs == ["World"]
+
 
 class TestReadSessionTitle:
     def test_reads_custom_title(self, tmp_path):
@@ -117,6 +142,34 @@ class TestReadSessionTitle:
         f = tmp_path / "s.jsonl"
         write_jsonl(f, [user_entry("hello")])
         assert sn._read_session_title(str(f)) is None
+
+    def test_skips_invalid_json_lines(self, tmp_path):
+        f = tmp_path / "s.jsonl"
+        f.write_text("not json\n" + json.dumps({"type": "custom-title", "customTitle": "my-title"}) + "\n")
+        assert sn._read_session_title(str(f)) == "my-title"
+
+    def test_returns_none_for_missing_file(self, tmp_path):
+        assert sn._read_session_title(str(tmp_path / "missing.jsonl")) is None
+
+
+class TestTextFromContent:
+    def test_string_passthrough(self):
+        assert sn._text_from_content("hello") == "hello"
+
+    def test_list_with_text_block(self):
+        # Real Claude Code messages use list content: [{"type": "text", "text": "..."}]
+        assert sn._text_from_content([{"type": "text", "text": "hello from list"}]) == "hello from list"
+
+    def test_list_skips_non_text_blocks_before_text(self):
+        content = [{"type": "tool_use", "name": "bash"}, {"type": "text", "text": "found it"}]
+        assert sn._text_from_content(content) == "found it"
+
+    def test_list_returns_empty_when_no_text_block(self):
+        assert sn._text_from_content([{"type": "tool_use", "name": "bash"}]) == ""
+
+    def test_non_list_non_string_returns_empty(self):
+        assert sn._text_from_content(None) == ""
+        assert sn._text_from_content(42) == ""
 
 
 class TestNormalizeTitle:
@@ -150,6 +203,10 @@ class TestNormalizeTitle:
         title = "ab-cd-ef-gh-ij-kl-mn-op-qr-st-uv-wx-yz-ab-cd-ef-gh-ij-klmnop"
         assert len(title) == 60, f"Expected 60, got {len(title)}"
         assert sn._normalize_title(title) == title
+
+    def test_all_special_chars_returns_none(self):
+        # After stripping non-alphanumeric chars, empty string fails the fullmatch regex check
+        assert sn._normalize_title("!!!") is None
 
 
 class TestBuildConversation:

@@ -107,6 +107,17 @@ class TestNameSession:
             result = sn.name_session("abc", str(f))
         assert result == "duplicate-title-name-2"
 
+    def test_returns_none_when_no_user_messages(self, tmp_path):
+        f = tmp_path / "s.jsonl"
+        write_jsonl(f, [
+            {"type": "user", "message": {"role": "user", "content": "/help"}},  # filtered as system
+            {"type": "assistant", "message": {"role": "assistant", "content": "Here is help"}},
+        ])
+        with patch.object(sn, "generate_title") as mock_gen:
+            result = sn.name_session("abc", str(f))
+        assert result is None
+        mock_gen.assert_not_called()
+
     def test_logs_stderr_on_exception(self, tmp_path, capsys):
         f = tmp_path / "s.jsonl"
         make_session(f)
@@ -240,3 +251,94 @@ class TestBackfillCandidates:
             with patch.object(sn, "generate_title", return_value="generated-title-name"):
                 sn.backfill(all_projects=False)
         assert "generated-title-name" in f.read_text()
+
+    def test_no_projects_dir(self, tmp_path, capsys):
+        with patch.object(sn.Path, "home", return_value=tmp_path):
+            sn.backfill(all_projects=True)
+        assert "No projects directory" in capsys.readouterr().out
+
+    def test_no_project_dir_for_cwd(self, tmp_path, capsys):
+        projects_dir = tmp_path / ".claude" / "projects"
+        projects_dir.mkdir(parents=True)
+        with patch.object(sn.Path, "home", return_value=tmp_path):
+            with patch.object(sn, "_cwd_project_dir", return_value=tmp_path / "nonexistent"):
+                sn.backfill(all_projects=False)
+        assert "No session directory" in capsys.readouterr().out
+
+    def test_all_projects(self, tmp_path, capsys):
+        projects_dir = tmp_path / ".claude" / "projects"
+        proj = projects_dir / "myproject"
+        proj.mkdir(parents=True)
+        f = proj / "s.jsonl"
+        make_session(f)
+        with patch.object(sn.Path, "home", return_value=tmp_path):
+            with patch.object(sn, "generate_title", return_value="all-projects-title"):
+                sn.backfill(all_projects=True)
+        assert "all-projects-title" in f.read_text()
+
+    def test_non_dir_entries_skipped_in_all_projects(self, tmp_path):
+        projects_dir = tmp_path / ".claude" / "projects"
+        proj = projects_dir / "myproject"
+        proj.mkdir(parents=True)
+        make_session(proj / "s.jsonl")
+        (projects_dir / "stray-file.json").write_text("{}")
+        with patch.object(sn.Path, "home", return_value=tmp_path):
+            with patch.object(sn, "generate_title", return_value="skipped-nondir-title"):
+                with patch("builtins.print"):
+                    sn.backfill(all_projects=True)
+        assert "skipped-nondir-title" in (proj / "s.jsonl").read_text()
+
+    def test_no_proposals_when_all_generation_fails(self, tmp_path, capsys):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        make_session(proj / "s.jsonl")
+        with patch.object(sn, "_cwd_project_dir", return_value=proj):
+            with patch.object(sn, "generate_title", return_value=None):
+                sn.backfill(all_projects=False)
+        assert "No titles could be generated" in capsys.readouterr().out
+
+    def test_dry_run_applies_on_confirm(self, tmp_path, capsys):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        f = proj / "s.jsonl"
+        make_session(f)
+        with patch.object(sn, "_cwd_project_dir", return_value=proj):
+            with patch.object(sn, "generate_title", return_value="dry-run-applied-title"):
+                with patch("builtins.input", return_value="y"):
+                    sn.backfill(all_projects=False, dry_run=True)
+        assert "dry-run-applied-title" in f.read_text()
+        assert "Applied" in capsys.readouterr().out
+
+    def test_dry_run_cancels_on_no(self, tmp_path, capsys):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        f = proj / "s.jsonl"
+        make_session(f)
+        original = f.read_text()
+        with patch.object(sn, "_cwd_project_dir", return_value=proj):
+            with patch.object(sn, "generate_title", return_value="dry-run-cancel-title"):
+                with patch("builtins.input", return_value="n"):
+                    sn.backfill(all_projects=False, dry_run=True)
+        assert f.read_text() == original
+        assert "Cancelled" in capsys.readouterr().out
+
+    def test_dry_run_cancels_on_eof(self, tmp_path, capsys):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        make_session(proj / "s.jsonl")
+        with patch.object(sn, "_cwd_project_dir", return_value=proj):
+            with patch.object(sn, "generate_title", return_value="dry-run-eof-title"):
+                with patch("builtins.input", side_effect=EOFError):
+                    sn.backfill(all_projects=False, dry_run=True)
+        assert "Cancelled" in capsys.readouterr().out
+
+
+class TestBackfillKeyboardInterrupt:
+    def test_keyboard_interrupt_during_generation(self, tmp_path, capsys):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        make_session(proj / "s.jsonl")
+        with patch.object(sn, "_cwd_project_dir", return_value=proj):
+            with patch.object(sn, "as_completed", side_effect=KeyboardInterrupt):
+                sn.backfill(all_projects=False)
+        assert "Cancelled" in capsys.readouterr().out

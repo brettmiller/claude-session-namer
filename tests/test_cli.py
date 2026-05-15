@@ -61,6 +61,88 @@ class TestHelpFlag:
             assert "Usage:" in result.stdout, f"Expected 'Usage:' for args {args}"
 
 
+class TestLoadSettings:
+    def test_returns_empty_dict_when_file_missing(self, tmp_path):
+        with patch.object(sn, "SETTINGS_FILE", tmp_path / "missing.json"):
+            assert sn._load_settings() == {}
+
+    def test_returns_empty_dict_on_invalid_json(self, tmp_path):
+        f = tmp_path / "settings.json"
+        f.write_text("not valid {{{ json")
+        with patch.object(sn, "SETTINGS_FILE", f):
+            assert sn._load_settings() == {}
+
+
+class TestInstall:
+    def test_installs_hook(self, tmp_path, capsys):
+        f = tmp_path / "settings.json"
+        f.write_text("{}")
+        with patch.object(sn, "SETTINGS_FILE", f):
+            with patch.object(sn, "SCRIPT_PATH", Path("/usr/local/bin/claude-session-namer")):
+                sn.install()
+        settings = json.loads(f.read_text())
+        commands = [hh["command"] for h in settings["hooks"]["SessionEnd"] for hh in h.get("hooks", [])]
+        assert any("claude-session-namer" in c for c in commands)
+        assert "Installed" in capsys.readouterr().out
+
+    def test_deduplicates_stale_entry(self, tmp_path):
+        settings = {"hooks": {"SessionEnd": [
+            {"hooks": [{"type": "command", "command": "/old/path/claude-session-namer"}]}
+        ]}}
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps(settings))
+        with patch.object(sn, "SETTINGS_FILE", f):
+            with patch.object(sn, "SCRIPT_PATH", Path("/new/path/claude-session-namer")):
+                sn.install()
+        settings = json.loads(f.read_text())
+        commands = [hh["command"] for h in settings["hooks"]["SessionEnd"] for hh in h.get("hooks", [])]
+        assert len(commands) == 1
+        assert "/new/path" in commands[0]
+
+    def test_creates_settings_file_when_missing(self, tmp_path, capsys):
+        f = tmp_path / "settings.json"
+        with patch.object(sn, "SETTINGS_FILE", f):
+            with patch.object(sn, "SCRIPT_PATH", Path("/usr/local/bin/claude-session-namer")):
+                sn.install()
+        assert f.exists()
+        assert "Installed" in capsys.readouterr().out
+
+
+class TestUninstall:
+    def test_removes_hook_and_cleans_up_keys(self, tmp_path, capsys):
+        settings = {"hooks": {"SessionEnd": [
+            {"hooks": [{"type": "command", "command": "/path/to/claude-session-namer"}]}
+        ]}}
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps(settings))
+        with patch.object(sn, "SETTINGS_FILE", f):
+            sn.uninstall()
+        result = json.loads(f.read_text())
+        assert "hooks" not in result
+        assert "Uninstalled" in capsys.readouterr().out
+
+    def test_leaves_other_hooks_intact(self, tmp_path):
+        settings = {"hooks": {"SessionEnd": [
+            {"hooks": [{"type": "command", "command": "/path/to/claude-session-namer"}]},
+            {"hooks": [{"type": "command", "command": "/path/to/other-hook"}]},
+        ]}}
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps(settings))
+        with patch.object(sn, "SETTINGS_FILE", f):
+            sn.uninstall()
+        result = json.loads(f.read_text())
+        remaining = result["hooks"]["SessionEnd"]
+        assert len(remaining) == 1
+        assert "other-hook" in remaining[0]["hooks"][0]["command"]
+
+    def test_uninstall_when_not_installed(self, tmp_path, capsys):
+        f = tmp_path / "settings.json"
+        f.write_text("{}")
+        with patch.object(sn, "SETTINGS_FILE", f):
+            sn.uninstall()
+        assert "Uninstalled" in capsys.readouterr().out
+
+
 class TestCwdProjectDir:
     def test_key_starts_with_dash(self):
         # Regression: lstrip("/") produced "Users-Brett-Miller-..." instead of "-Users-Brett-Miller-..."
